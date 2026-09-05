@@ -675,6 +675,8 @@ impl PyTreeSA {
 ///     surgery_levels: Number of initial inverse-temperature levels that use
 ///                     one greedy cut-surgery proposal in place of each sweep.
 ///     treesa: Base TreeSA configuration. If None, uses TreeSA().
+///     retain_best: Return the best internal-TC checkpoint rather than the
+///                  final endpoint. Defaults to False to avoid scoring overhead.
 #[pyclass(name = "SurgeryTreeSA")]
 #[derive(Clone)]
 pub struct PySurgeryTreeSA {
@@ -684,11 +686,11 @@ pub struct PySurgeryTreeSA {
 #[pymethods]
 impl PySurgeryTreeSA {
     #[new]
-    #[pyo3(signature = (surgery_levels, treesa=None))]
-    fn new(surgery_levels: usize, treesa: Option<PyTreeSA>) -> Self {
+    #[pyo3(signature = (surgery_levels, treesa=None, retain_best=false))]
+    fn new(surgery_levels: usize, treesa: Option<PyTreeSA>, retain_best: bool) -> Self {
         let treesa = treesa.map_or_else(TreeSA::default, |config| config.inner);
         Self {
-            inner: SurgeryTreeSA::new(treesa, surgery_levels),
+            inner: SurgeryTreeSA::new(treesa, surgery_levels).with_retain_best(retain_best),
         }
     }
 
@@ -696,6 +698,12 @@ impl PySurgeryTreeSA {
     #[getter]
     fn surgery_levels(&self) -> usize {
         self.inner.surgery_levels
+    }
+
+    /// Whether the best internal-TC checkpoint is retained.
+    #[getter]
+    fn retain_best(&self) -> bool {
+        self.inner.retain_best
     }
 
     /// Base TreeSA configuration.
@@ -708,8 +716,9 @@ impl PySurgeryTreeSA {
 
     fn __repr__(&self) -> String {
         format!(
-            "SurgeryTreeSA(surgery_levels={}, treesa={})",
+            "SurgeryTreeSA(surgery_levels={}, retain_best={}, treesa={})",
             self.inner.surgery_levels,
+            self.inner.retain_best,
             PyTreeSA {
                 inner: self.inner.treesa.clone()
             }

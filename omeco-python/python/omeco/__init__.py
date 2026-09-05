@@ -19,7 +19,7 @@ Classes:
                preprocess=True, surgery_iters=0, surgery_probability=0.0)
         TreeSA.fast(score=None)
     SurgeryTreeSA: Paper-style early surgery followed by ordinary TreeSA.
-        SurgeryTreeSA(surgery_levels, treesa=None)
+        SurgeryTreeSA(surgery_levels, treesa=None, retain_best=False)
 
     Treewidth: Scalable treewidth-heuristic elimination-order optimizer.
         Treewidth(algorithm="min_degree")
