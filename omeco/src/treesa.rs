@@ -547,9 +547,10 @@ fn init_random_recursive<R: Rng>(
 
 /// Run simulated annealing on a single tree.
 /// Each iteration sweeps through all nodes in the tree, attempting mutations.
-/// Matches Julia's `optimize_tree_sa!` exactly, with in-place mutation for performance.
+/// Returns the best emitted-tree score seen at initialization or after a sweep.
+/// Uphill moves still advance the live annealing state.
 #[allow(clippy::too_many_arguments)]
-fn optimize_tree_sa<R: Rng>(
+fn optimize_tree_sa<R: Rng, F: Fn(&ExprTree) -> f64>(
     mut tree: ExprTree,
     log2_sizes: &[f64],
     betas: &[f64],
@@ -558,7 +559,11 @@ fn optimize_tree_sa<R: Rng>(
     decomp: DecompositionType,
     rng: &mut R,
     nedge: usize,
+    score_tree: &F,
 ) -> ExprTree {
+    let mut best = tree.clone();
+    let mut best_score = score_tree(&tree);
+
     // Compute log2_rw_weight once (matches Julia: log2rw_weight = log2(score.rw_weight))
     let log2_rw_weight = if score.rw_weight > 0.0 {
         score.rw_weight.log2()
@@ -583,9 +588,14 @@ fn optimize_tree_sa<R: Rng>(
                 rng,
                 &mut scratch,
             );
+            let candidate_score = score_tree(&tree);
+            if nan_last(candidate_score, best_score).is_lt() {
+                best_score = candidate_score;
+                best = tree.clone();
+            }
         }
     }
-    tree
+    best
 }
 
 /// Cold, sparse schedule for refining an already-optimized tree.
@@ -1053,7 +1063,7 @@ where
 /// proposals. Surgery replaces a sweep, uses the current beta, and never
 /// changes or restarts the cooling schedule.
 #[allow(clippy::too_many_arguments)]
-fn optimize_tree_sa_mixed<R: Rng>(
+fn optimize_tree_sa_mixed<R: Rng, F: Fn(&ExprTree) -> f64>(
     mut tree: ExprTree,
     log2_sizes: &[f64],
     betas: &[f64],
@@ -1064,7 +1074,10 @@ fn optimize_tree_sa_mixed<R: Rng>(
     nedge: usize,
     surgery: &WaistUpdate,
     surgery_probability: f64,
+    score_tree: &F,
 ) -> ExprTree {
+    let mut best = tree.clone();
+    let mut best_score = score_tree(&tree);
     let log2_rw_weight = if score.rw_weight > 0.0 {
         score.rw_weight.log2()
     } else {
@@ -1103,9 +1116,14 @@ fn optimize_tree_sa_mixed<R: Rng>(
                     &mut scratch,
                 );
             }
+            let candidate_score = score_tree(&tree);
+            if nan_last(candidate_score, best_score).is_lt() {
+                best_score = candidate_score;
+                best = tree.clone();
+            }
         }
     }
-    tree
+    best
 }
 
 /// Run the paper's two-phase Surgery TreeSA schedule on one initialized tree.
@@ -1822,6 +1840,11 @@ fn optimize_treesa_core_seeded_mode<L: Label>(
 
                 // Optimize. A configured surgery rule replaces local sweeps at
                 // the current beta; it never starts a separate anneal.
+                let score_tree = |candidate: &ExprTree| {
+                    let nested = expr_tree_to_nested(candidate, &code.ixs, &labels, &code.iy);
+                    let cc = crate::contraction_complexity(&nested, size_dict, &code.ixs);
+                    config.score.evaluate(cc.tc, cc.sc, cc.rwc)
+                };
                 let optimized = if prefix_surgery {
                     let exact_tc = |candidate: &ExprTree| {
                         let nested = expr_tree_to_nested(candidate, &code.ixs, &labels, &code.iy);
@@ -1854,6 +1877,7 @@ fn optimize_treesa_core_seeded_mode<L: Label>(
                         nedge,
                         surgery,
                         config.surgery_probability,
+                        &score_tree,
                     )
                 } else {
                     optimize_tree_sa(
@@ -1865,6 +1889,7 @@ fn optimize_treesa_core_seeded_mode<L: Label>(
                         config.decomposition_type,
                         &mut rng,
                         nedge,
+                        &score_tree,
                     )
                 };
 
@@ -2576,6 +2601,12 @@ mod tests {
                         config.decomposition_type,
                         &mut trng,
                         nedge,
+                        &|candidate| {
+                            let nested =
+                                expr_tree_to_nested(candidate, &code.ixs, &labels, &code.iy);
+                            let cc = contraction_complexity(&nested, &size_dict, &code.ixs);
+                            config.score.evaluate(cc.tc, cc.sc, cc.rwc)
+                        },
                     );
                     let nested = expr_tree_to_nested(&optimized, &code.ixs, &labels, &code.iy);
                     let tcc = contraction_complexity(&nested, &size_dict, &code.ixs);
@@ -2590,6 +2621,79 @@ mod tests {
                  (ixs {:?} iy {:?})",
                 code.ixs,
                 code.iy,
+            );
+        }
+    }
+
+    #[test]
+    fn test_treesa_returns_best_checkpoint_not_endpoint() {
+        let code = grid_code(3, 3);
+        let sizes: HashMap<usize, usize> =
+            code.unique_labels().into_iter().map(|l| (l, 2)).collect();
+        let (label_map, labels) = build_label_map(&code);
+        let ixs = convert_to_int_indices(&code.ixs, &label_map);
+        let iy: Vec<usize> = code.iy.iter().map(|l| label_map[l]).collect();
+        let log2_sizes = vec![1.0; labels.len()];
+        let surgery = WaistUpdate::new(&ixs, &iy, &log2_sizes);
+        let score = ScoreFunction::default().with_rw_weight(0.25);
+        let exact_score = |tree: &ExprTree| {
+            let nested = expr_tree_to_nested(tree, &code.ixs, &labels, &code.iy);
+            let cc = crate::contraction_complexity(&nested, &sizes, &code.ixs);
+            score.evaluate(cc.tc, cc.sc, cc.rwc)
+        };
+
+        for mixed in [false, true] {
+            let mut saw_worse_endpoint = false;
+            for seed in 0..8 {
+                let mut rng = SmallRng::seed_from_u64(seed);
+                let tree = init_random(&ixs, &iy, labels.len(), DecompositionType::Tree, &mut rng);
+                let checkpoints = std::cell::RefCell::new(Vec::new());
+                let record_score = |tree: &ExprTree| {
+                    let value = exact_score(tree);
+                    checkpoints.borrow_mut().push(value);
+                    value
+                };
+                // At beta=0 uphill moves are accepted, making endpoint damage likely.
+                let best = if mixed {
+                    optimize_tree_sa_mixed(
+                        tree,
+                        &log2_sizes,
+                        &[0.0],
+                        30,
+                        &score,
+                        DecompositionType::Tree,
+                        &mut rng,
+                        labels.len(),
+                        &surgery,
+                        0.25,
+                        &record_score,
+                    )
+                } else {
+                    optimize_tree_sa(
+                        tree,
+                        &log2_sizes,
+                        &[0.0],
+                        30,
+                        &score,
+                        DecompositionType::Tree,
+                        &mut rng,
+                        labels.len(),
+                        &record_score,
+                    )
+                };
+                let checkpoints = checkpoints.into_inner();
+                assert_eq!(
+                    checkpoints.len(),
+                    31,
+                    "include initialization and every sweep"
+                );
+                let minimum = checkpoints.iter().copied().fold(f64::INFINITY, f64::min);
+                assert_eq!(exact_score(&best), minimum);
+                saw_worse_endpoint |= *checkpoints.last().unwrap() > minimum;
+            }
+            assert!(
+                saw_worse_endpoint,
+                "fixture must distinguish best from endpoint"
             );
         }
     }
@@ -3981,6 +4085,10 @@ mod tests {
             4,
             &surgery,
             1.0,
+            &|candidate| {
+                let (tc, sc, rw) = tree_complexity(candidate, &[1.0; 4]);
+                score.evaluate(tc, sc, rw)
+            },
         );
         assert_eq!(format!("{after:?}"), before);
     }
@@ -4038,6 +4146,13 @@ mod tests {
                 ctx.nedge,
                 &surgery,
                 1.0,
+                &|candidate| {
+                    if format!("{candidate:?}") == format!("{expected:?}") {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                },
             );
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
             return;
